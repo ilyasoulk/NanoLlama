@@ -28,9 +28,9 @@ class MLP(nn.Module):
 
 
 class ROPE(nn.Module):
-    def __init__(self, d_model: int, base: float = 10_000.0) -> None:
+    def __init__(self, d_head: int, base: float = 10_000.0) -> None:
         super().__init__()
-        freq = 1.0 / (base) ** (torch.arange(0, d_model, 2) / d_model)  # (D / 2,)
+        freq = 1.0 / (base) ** (torch.arange(0, d_head, 2) / d_head)  # (D / 2,)
         self.register_buffer("freq", freq)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
