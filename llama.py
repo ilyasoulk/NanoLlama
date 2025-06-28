@@ -18,13 +18,13 @@ class MLP(nn.Module):
     def __init__(self, hidden_dim: int) -> None:
         super().__init__()
         self.up_proj = nn.Linear(hidden_dim, 2 * hidden_dim)
-        self.down_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
         self.swiglu = Swiglu(hidden_dim=hidden_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_up = self.up_proj(x)
         activations = self.swiglu(x_up)
-        return self.down_proj(activations)
+        return self.out_proj(activations)
 
 
 class ROPE(nn.Module):
@@ -69,10 +69,19 @@ class RMSNorm(nn.Module):
 class SelfAttention(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        pass
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x
+    def forward(
+        self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor
+    ) -> torch.Tensor:
+        # (B, S, N_head, D_head)
+        d_head = Q.size(-1)
+
+        Q = Q.transpose(1, 2)  # (B, N_head, S, D_head)
+        K = K.transpose(1, 2)  # (B, N_head, S, D_head)
+        V = V.transpose(1, 2)  # (B, N_head, S, D_head)
+
+        attn_scores = Q @ K.transpose(-1, -2) / d_head**0.5  # (B, N_head, S, S)
+        return attn_scores.softmax(-1) @ V
 
 
 class GroupedQueryAttention(nn.Module):
