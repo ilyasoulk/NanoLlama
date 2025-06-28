@@ -34,21 +34,25 @@ class ROPE(nn.Module):
         self.register_buffer("freq", freq)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.size(0) % 2 == 0  # (B, S, N_head, D_head)
+        assert x.size(-1) % 2 == 0  # (B, S, N_head, D_head)
         B, S, N_head, D_head = x.shape
-        x_complex = x.view(B, S, N_head, D_head // 2, 2)
+        x_complex = x.view(
+            B, S, N_head, D_head // 2, 2
+        )  # (B, S, N_head, D_head // 2, 2)
 
         pos = torch.arange(0, S, device=x.device, dtype=x.dtype)  # (S,)
         theta = torch.outer(pos, self.freq)  # (S, D/2)
         cos, sin = (
-            theta.cos()[None, :, None, :],
-            theta.sin()[None, :, None, :],
-        )  # (1, S, 1, D/2)
+            theta.cos()[None, :, None, None, :],
+            theta.sin()[None, :, None, None, :],
+        )  # (1, S, 1, 1, D/2)
 
-        x1, x2 = x.unbind(-1)
-        out = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
+        x1, x2 = x_complex.unbind(-1)
+        out = torch.stack(
+            (x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1
+        )  # (B, S, N_head, D_head // 2, 2)
 
-        return out
+        return out.flatten(-2)  # (B, S, N_head, D_head)
 
 
 class RMSNorm(nn.Module):
