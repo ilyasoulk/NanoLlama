@@ -9,10 +9,8 @@ class Swiglu(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert x.shape[-1] == 2 * self.hidden_dim
-
         a = x[..., : self.hidden_dim]
         b = x[..., self.hidden_dim :]
-
         return a * (b * torch.sigmoid(b))
 
 
@@ -29,13 +27,28 @@ class MLP(nn.Module):
         return self.down_proj(activations)
 
 
-class Rope(nn.Module):
-    def __init__(self) -> None:
+class ROPE(nn.Module):
+    def __init__(self, d_model: int, base: float = 10_000.0) -> None:
         super().__init__()
-        pass
+        freq = 1.0 / (base) ** (torch.arange(0, d_model, 2) / d_model)  # (D / 2,)
+        self.register_buffer("freq", freq)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x
+        assert x.size(0) % 2 == 0  # (B, S, N_head, D_head)
+        B, S, N_head, D_head = x.shape
+        x_complex = x.view(B, S, N_head, D_head // 2, 2)
+
+        pos = torch.arange(0, S, device=x.device, dtype=x.dtype)  # (S,)
+        theta = torch.outer(pos, self.freq)  # (S, D/2)
+        cos, sin = (
+            theta.cos()[None, :, None, :],
+            theta.sin()[None, :, None, :],
+        )  # (1, S, 1, D/2)
+
+        x1, x2 = x.unbind(-1)
+        out = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
+
+        return out
 
 
 class RMSNorm(nn.Module):
