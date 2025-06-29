@@ -67,13 +67,18 @@ class RMSNorm(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, causal: bool = False) -> None:
+        self.causal = causal
         super().__init__()
 
     def forward(
         self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor
     ) -> torch.Tensor:
         # (B, S, N_head, D_head)
+        assert len(Q.shape) == 4
+        assert len(K.shape) == 4
+        assert len(V.shape) == 4
+
         d_head = Q.size(-1)
 
         Q = Q.transpose(1, 2)  # (B, N_head, S, D_head)
@@ -81,16 +86,57 @@ class SelfAttention(nn.Module):
         V = V.transpose(1, 2)  # (B, N_head, S, D_head)
 
         attn_scores = Q @ K.transpose(-1, -2) / d_head**0.5  # (B, N_head, S, S)
+
+        if self.causal:
+            # TODO : very inefficient mask, change this later
+            mask = torch.ones_like(attn_scores) * -float("Inf")
+            mask = torch.triu(mask)
+            attn_scores += mask
+
         return attn_scores.softmax(-1) @ V
 
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, d_model, d_head: int, kv_heads: int, q_heads: int) -> None:
         super().__init__()
-        pass
+        assert d_model / kv_heads == d_head
+        assert d_model / q_heads == d_head
+        assert q_heads > kv_heads
+        assert q_heads % kv_heads == 0
+
+        self.q_heads = q_heads
+        self.kv_heads = kv_heads
+        self.d_head = d_head
+
+        self.W_q = nn.Linear(d_model, q_heads * d_head)
+        self.W_kv = nn.Linear(d_model, 2 * kv_heads * d_head)
+
+        self.rope = ROPE(d_head=d_head)
+        self.self_attn = SelfAttention()
+
+        self.W_out = nn.Linear(d_model, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x
+        B, seq_len, d_model = x.shape
+
+        Q = self.W_q(x)
+        kv = self.W_kv(x)
+        K, V = kv.chunk(2, dim=-1)
+
+        Q = Q.reshape(B, seq_len, self.q_heads, self.d_head)
+        K = K.reshape(B, seq_len, self.kv_heads, self.d_head)
+        V = V.reshape(B, seq_len, self.kv_heads, self.d_head)
+
+        Q = self.rope(Q)
+        K = self.rope(K)
+
+        K = K.repeat_interleave(self.q_heads / self.kv_heads, dim=2)
+
+        attn = self.self_attn(Q, K, V)
+
+        attn = attn.reshape(B, seq_len, d_model)
+
+        return self.W_out(attn)
 
 
 class Encoder(nn.Module):
