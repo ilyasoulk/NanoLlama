@@ -97,7 +97,9 @@ class SelfAttention(nn.Module):
 
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, d_model, d_head: int, kv_heads: int, q_heads: int) -> None:
+    def __init__(
+        self, d_model, d_head: int, kv_heads: int, q_heads: int, causal: bool = False
+    ) -> None:
         super().__init__()
         assert d_model / kv_heads == d_head
         assert d_model / q_heads == d_head
@@ -112,7 +114,7 @@ class GroupedQueryAttention(nn.Module):
         self.W_kv = nn.Linear(d_model, 2 * kv_heads * d_head)
 
         self.rope = ROPE(d_head=d_head)
-        self.self_attn = SelfAttention()
+        self.self_attn = SelfAttention(causal=causal)
 
         self.W_out = nn.Linear(d_model, d_model)
 
@@ -140,21 +142,33 @@ class GroupedQueryAttention(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, d_model: int, d_head: int, kv_heads: int, q_heads: int) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        d_head: int,
+        kv_heads: int,
+        q_heads: int,
+        causal: bool = False,
+    ) -> None:
         super().__init__()
-        self.norm = RMSNorm(d_model=d_model)
+        self.attn_norm = RMSNorm(d_model=d_model)
+        self.ffn_norm = RMSNorm(d_model=d_model)
         self.GQA = GroupedQueryAttention(
-            d_model=d_model, d_head=d_head, kv_heads=kv_heads, q_heads=q_heads
+            d_model=d_model,
+            d_head=d_head,
+            kv_heads=kv_heads,
+            q_heads=q_heads,
+            causal=causal,
         )
         self.ffn = MLP(d_model=d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_norm = self.norm(x)
+        x_norm = self.attn_norm(x)
         attn = self.GQA(x_norm)
         attn += x
 
-        attn_norm = self.norm(attn)
-        ffn_out = self.ffn(attn_norm)
+        ffn_norm = self.ffn_norm(attn)
+        ffn_out = self.ffn(ffn_norm)
         ffn_out += attn
 
         return ffn_out
@@ -169,15 +183,55 @@ class LLama(nn.Module):
         d_head: int,
         kv_heads: int,
         q_heads: int,
+        causal: bool = False,
     ) -> None:
         super().__init__()
         self.embeddings = nn.Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
 
         self.seq = nn.Sequential(*[
-            Encoder(d_model=d_model, d_head=d_head, kv_heads=kv_heads, q_heads=q_heads)
+            Encoder(
+                d_model=d_model,
+                d_head=d_head,
+                kv_heads=kv_heads,
+                q_heads=q_heads,
+                causal=causal,
+            )
             for _ in range(num_layers)
         ])
+        self.norm = RMSNorm(d_model=d_model)
+        self.out = nn.Linear(d_model, vocab_size, bias=False)
+        self.out.weight = self.embeddings.weight
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.embeddings(x)
-        return self.seq(x)
+        x_emb = self.embeddings(x)
+        x_out = self.seq(x_emb)
+
+        x_norm = self.norm(x_out)
+
+        return self.out(x_norm)
+
+
+if __name__ == "__main__":
+    vocab_size = 10_000
+    batch_size = 32
+    seq_len = 128
+    # -----
+    d_model = 256
+    num_layers = 2
+    d_head = 32
+    kv_heads = 4
+    q_heads = 8
+    token_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+
+    model = LLama(
+        num_layers=num_layers,
+        d_model=d_model,
+        vocab_size=vocab_size,
+        d_head=d_head,
+        kv_heads=kv_heads,
+        q_heads=q_heads,
+    )
+
+    logits = model(token_ids)
+
+    # assert logits.shape == ()
