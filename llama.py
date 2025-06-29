@@ -3,23 +3,23 @@ import torch.nn as nn
 
 
 class Swiglu(nn.Module):
-    def __init__(self, hidden_dim: int):
+    def __init__(self, d_model: int):
         super().__init__()
-        self.hidden_dim = hidden_dim
+        self.d_model = d_model
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.shape[-1] == 2 * self.hidden_dim
-        a = x[..., : self.hidden_dim]
-        b = x[..., self.hidden_dim :]
+        assert x.shape[-1] == 2 * self.d_model
+        a = x[..., : self.d_model]
+        b = x[..., self.d_model :]
         return a * (b * torch.sigmoid(b))
 
 
 class MLP(nn.Module):
-    def __init__(self, hidden_dim: int) -> None:
+    def __init__(self, d_model: int) -> None:
         super().__init__()
-        self.up_proj = nn.Linear(hidden_dim, 2 * hidden_dim)
-        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.swiglu = Swiglu(hidden_dim=hidden_dim)
+        self.up_proj = nn.Linear(d_model, 2 * d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.swiglu = Swiglu(d_model=d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_up = self.up_proj(x)
@@ -140,12 +140,24 @@ class GroupedQueryAttention(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, d_model: int, d_head: int, kv_heads: int, q_heads: int) -> None:
         super().__init__()
-        pass
+        self.norm = RMSNorm(d_model=d_model)
+        self.GQA = GroupedQueryAttention(
+            d_model=d_model, d_head=d_head, kv_heads=kv_heads, q_heads=q_heads
+        )
+        self.ffn = MLP(d_model=d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x
+        x_norm = self.norm(x)
+        attn = self.GQA(x_norm)
+        attn += x
+
+        attn_norm = self.norm(attn)
+        ffn_out = self.ffn(attn_norm)
+        ffn_out += attn
+
+        return ffn_out
 
 
 class LLama(nn.Module):
