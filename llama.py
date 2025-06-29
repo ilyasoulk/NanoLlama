@@ -161,9 +161,23 @@ class Encoder(nn.Module):
 
 
 class LLama(nn.Module):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        num_layers: int,
+        d_model: int,
+        vocab_size: int,
+        d_head: int,
+        kv_heads: int,
+        q_heads: int,
+    ) -> None:
         super().__init__()
-        pass
+        self.embeddings = nn.Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
+
+        self.seq = nn.Sequential(*[
+            Encoder(d_model=d_model, d_head=d_head, kv_heads=kv_heads, q_heads=q_heads)
+            for _ in range(num_layers)
+        ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x
+        x = self.embeddings(x)
+        return self.seq(x)
