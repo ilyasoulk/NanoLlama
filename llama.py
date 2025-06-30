@@ -43,14 +43,20 @@ class ROPE(nn.Module):
         pos = torch.arange(0, S, device=x.device, dtype=x.dtype)  # (S,)
         theta = torch.outer(pos, self.freq)  # (S, D/2)
         cos, sin = (
-            theta.cos()[None, :, None, None, :],
-            theta.sin()[None, :, None, None, :],
+            theta.cos()[None, :, None, :],
+            theta.sin()[None, :, None, :],
         )  # (1, S, 1, 1, D/2)
 
         x1, x2 = x_complex.unbind(-1)
-        out = torch.stack(
-            (x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1
-        )  # (B, S, N_head, D_head // 2, 2)
+        # import ipdb
+        #
+        # ipdb.set_trace()
+        x1_pos = x1 * cos - x2 * sin
+        x2_pos = x1 * sin + x2 * cos
+        # out = torch.stack(
+        #     (x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1
+        # )  # (B, S, N_head, D_head // 2, 2)
+        out = torch.stack((x1_pos, x2_pos), dim=-1)
 
         return out.flatten(-2)  # (B, S, N_head, D_head)
 
@@ -101,8 +107,6 @@ class GroupedQueryAttention(nn.Module):
         self, d_model, d_head: int, kv_heads: int, q_heads: int, causal: bool = False
     ) -> None:
         super().__init__()
-        assert d_model / kv_heads == d_head
-        assert d_model / q_heads == d_head
         assert q_heads > kv_heads
         assert q_heads % kv_heads == 0
 
@@ -132,7 +136,8 @@ class GroupedQueryAttention(nn.Module):
         Q = self.rope(Q)
         K = self.rope(K)
 
-        K = K.repeat_interleave(self.q_heads / self.kv_heads, dim=2)
+        K = K.repeat_interleave(self.q_heads // self.kv_heads, dim=2)
+        V = V.repeat_interleave(self.q_heads // self.kv_heads, dim=2)
 
         attn = self.self_attn(Q, K, V)
 
@@ -184,6 +189,7 @@ class LLama(nn.Module):
         kv_heads: int,
         q_heads: int,
         causal: bool = False,
+        device: str = "mps",
     ) -> None:
         super().__init__()
         self.embeddings = nn.Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
@@ -212,6 +218,14 @@ class LLama(nn.Module):
 
 
 if __name__ == "__main__":
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "mps"
+        if torch.mps.is_available()
+        else "cpu"
+    )
+
     vocab_size = 10_000
     batch_size = 32
     seq_len = 128
@@ -232,6 +246,10 @@ if __name__ == "__main__":
         q_heads=q_heads,
     )
 
+    model = model.to(device)
+
+    token_ids = token_ids.to(device)
+
     logits = model(token_ids)
 
-    # assert logits.shape == ()
+    assert logits.shape == (batch_size, seq_len, vocab_size)
