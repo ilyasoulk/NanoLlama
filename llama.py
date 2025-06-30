@@ -73,9 +73,13 @@ class RMSNorm(nn.Module):
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, causal: bool = False) -> None:
-        self.causal = causal
+    def __init__(self, seq_len: int, causal: bool = False) -> None:
         super().__init__()
+        self.causal = causal
+        if self.causal:
+            self.register_buffer(
+                "mask", torch.tril(torch.ones((seq_len, seq_len)))[None, None, :, :]
+            )
 
     def forward(
         self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor
@@ -94,17 +98,20 @@ class SelfAttention(nn.Module):
         attn_scores = Q @ K.transpose(-1, -2) / d_head**0.5  # (B, N_head, S, S)
 
         if self.causal:
-            # TODO : very inefficient mask, change this later
-            mask = torch.ones_like(attn_scores) * -float("Inf")
-            mask = torch.triu(mask)
-            attn_scores += mask
+            attn_scores.masked_fill(self.mask == 0, float("-inf"))
 
         return attn_scores.softmax(-1) @ V
 
 
 class GroupedQueryAttention(nn.Module):
     def __init__(
-        self, d_model, d_head: int, kv_heads: int, q_heads: int, causal: bool = False
+        self,
+        d_model,
+        d_head: int,
+        kv_heads: int,
+        q_heads: int,
+        seq_len: int,
+        causal: bool = False,
     ) -> None:
         super().__init__()
         assert q_heads > kv_heads
@@ -118,7 +125,7 @@ class GroupedQueryAttention(nn.Module):
         self.W_kv = nn.Linear(d_model, 2 * kv_heads * d_head)
 
         self.rope = ROPE(d_head=d_head)
-        self.self_attn = SelfAttention(causal=causal)
+        self.self_attn = SelfAttention(seq_len=seq_len, causal=causal)
 
         self.W_out = nn.Linear(d_model, d_model)
 
@@ -153,6 +160,7 @@ class Encoder(nn.Module):
         d_head: int,
         kv_heads: int,
         q_heads: int,
+        seq_len: int,
         causal: bool = False,
     ) -> None:
         super().__init__()
@@ -163,6 +171,7 @@ class Encoder(nn.Module):
             d_head=d_head,
             kv_heads=kv_heads,
             q_heads=q_heads,
+            seq_len=seq_len,
             causal=causal,
         )
         self.ffn = MLP(d_model=d_model)
@@ -188,8 +197,8 @@ class LLama(nn.Module):
         d_head: int,
         kv_heads: int,
         q_heads: int,
+        seq_len: int,
         causal: bool = False,
-        device: str = "mps",
     ) -> None:
         super().__init__()
         self.embeddings = nn.Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
@@ -200,6 +209,7 @@ class LLama(nn.Module):
                 d_head=d_head,
                 kv_heads=kv_heads,
                 q_heads=q_heads,
+                seq_len=seq_len,
                 causal=causal,
             )
             for _ in range(num_layers)
@@ -244,6 +254,7 @@ if __name__ == "__main__":
         d_head=d_head,
         kv_heads=kv_heads,
         q_heads=q_heads,
+        seq_len=seq_len,
     )
 
     model = model.to(device)
