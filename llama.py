@@ -1,8 +1,11 @@
+import yaml
+import argparse
 from dataclasses import dataclass
-from transformers import LlamaForCausalLM
+
 
 import torch
 import torch.nn as nn
+from transformers import LlamaForCausalLM
 
 
 # def load_weights(torch_model: nn.Module, hf_model: LlamaForCausalLM) -> nn.Module:
@@ -18,7 +21,10 @@ class LlamaConfig:
     d_head: int
     num_layers: int
     seq_len: int
+    rms_norm_eps: float
+    batch_size: int
     causal: bool = False
+    do_flash: bool = False
 
 
 class SiLU(nn.Module):
@@ -87,13 +93,14 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.gain = nn.Parameter(torch.ones(d_model))
         self.eps = eps
+        self.d_model = d_model
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         rms = torch.mean(x**2, keepdim=True, dim=-1).sqrt()
         return (x / (rms + self.eps)) * self.gain
 
     def __repr__(self):
-        return f"{self.__class__.__name__}(d_model={d_model}, eps={self.eps})"
+        return f"{self.__class__.__name__}(d_model={self.d_model}, eps={self.eps})"
 
 
 class GroupedQueryAttention(nn.Module):
@@ -166,8 +173,8 @@ class GroupedQueryAttention(nn.Module):
                 attn_scores.masked_fill(self.mask == 0, float("-inf"))
             attn = attn_scores.softmax(dim=-1) @ V  # (B, N_head, S, d_head)
             attn = attn.transpose(1, 2)  # (B, S, N_head, d_head)
-            attn = attn.reshape(B, seq_len, d_model)
 
+        attn = attn.reshape(B, seq_len, d_model)
         return self.o_proj(attn)
 
 
@@ -180,6 +187,7 @@ class LlamaDecoderLayer(nn.Module):
         q_heads: int,
         seq_len: int,
         causal: bool = False,
+        do_flash: bool = False,
     ) -> None:
         super().__init__()
         self.self_attn = GroupedQueryAttention(
@@ -189,6 +197,7 @@ class LlamaDecoderLayer(nn.Module):
             q_heads=q_heads,
             seq_len=seq_len,
             causal=causal,
+            do_flash=do_flash,
         )
         self.mlp = LlamaMLP(d_model=d_model)
         self.input_layernorm = RMSNorm(d_model=d_model)
@@ -221,11 +230,12 @@ class LlamaModel(nn.Module):
                 q_heads=config.q_heads,
                 seq_len=config.seq_len,
                 causal=config.causal,
+                do_flash=config.do_flash,
             )
-            for _ in range(num_layers)
+            for _ in range(config.num_layers)
         ])
-        self.norm = RMSNorm(d_model=d_model)
-        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.norm = RMSNorm(d_model=config.d_model)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.lm_head.weight = self.embed_tokens.weight
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -239,6 +249,17 @@ class LlamaModel(nn.Module):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--config_file", type=str)
+
+    args = parser.parse_args()
+
+    with open(args.config_file, "r") as f:
+        config = yaml.safe_load(f)
+
+    llama_config = LlamaConfig(**config)
+
     device = torch.device(
         "cuda"
         if torch.cuda.is_available()
@@ -247,28 +268,11 @@ if __name__ == "__main__":
         else "cpu"
     )
 
-    vocab_size = 10_000
-    batch_size = 32
-    seq_len = 128
-    # -----
-    d_model = 256
-    num_layers = 2
-    d_head = 32
-    kv_heads = 4
-    q_heads = 8
-
-    config = LlamaConfig(
-        num_layers=num_layers,
-        d_model=d_model,
-        vocab_size=vocab_size,
-        d_head=d_head,
-        kv_heads=kv_heads,
-        q_heads=q_heads,
-        seq_len=seq_len,
+    token_ids = torch.randint(
+        0, llama_config.vocab_size, (llama_config.batch_size, llama_config.seq_len)
     )
-    token_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
 
-    model = LlamaModel(config=config)
+    model = LlamaModel(config=llama_config)
 
     model = model.to(device)
 
@@ -276,4 +280,8 @@ if __name__ == "__main__":
 
     logits = model(token_ids)
 
-    assert logits.shape == (batch_size, seq_len, vocab_size)
+    assert logits.shape == (
+        llama_config.batch_size,
+        llama_config.seq_len,
+        llama_config.vocab_size,
+    )
