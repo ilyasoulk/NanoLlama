@@ -5,11 +5,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from transformers import LlamaForCausalLM
-
-
-# def load_weights(torch_model: nn.Module, hf_model: LlamaForCausalLM) -> nn.Module:
-#     embed_tokens = hf_model.model.embed_tokens
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 @dataclass
@@ -215,7 +211,7 @@ class LlamaDecoderLayer(nn.Module):
         return ffn_out
 
 
-class LlamaModel(nn.Module):
+class Llama(nn.Module):
     def __init__(self, config: LlamaConfig) -> None:
         super().__init__()
         self.embed_tokens = nn.Embedding(
@@ -247,18 +243,51 @@ class LlamaModel(nn.Module):
 
         return self.lm_head(x_norm)
 
+    @classmethod
+    def from_pretrained(cls, model_id: str) -> nn.Module:
+        with open(f"configs/{model_id}.yaml", "r") as f:
+            config = yaml.safe_load(f)
+
+        llama_config = LlamaConfig(**config)
+        model = cls(config=llama_config)
+        hf_model = AutoModelForCausalLM.from_pretrained(model_id)
+
+        # EMBEDDING TOKENS
+        model.embed_tokens.weight = hf_model.model.embed_tokens.weight
+
+        # DECODER LAYERS
+        for torch_layer, hf_layer in zip(model.layers, hf_model.model.layers):
+            # SELF ATTENTION BLOCK
+            torch_layer.self_attn.q_proj.weight = hf_layer.self_attn.q_proj.weight
+            torch_layer.self_attn.k_proj.weight = hf_layer.self_attn.k_proj.weight
+            torch_layer.self_attn.v_proj.weight = hf_layer.self_attn.v_proj.weight
+            torch_layer.self_attn.o_proj.weight = hf_layer.self_attn.o_proj.weight
+
+            # MLP BLOCK
+            torch_layer.mlp.gate_proj.weight = hf_layer.mlp.gate_proj.weight
+            torch_layer.mlp.up_proj.weight = hf_layer.mlp.up_proj.weight
+            torch_layer.mlp.down_proj.weight = hf_layer.mlp.down_proj.weight
+
+            # NORMS
+            torch_layer.input_layernorm.gain.weight = hf_layer.input_layernorm.weight
+            torch_layer.post_attention_layernorm.gain.weight = (
+                hf_layer.post_attention_layernorm.weight
+            )
+
+        # OUT NORM
+        model.norm.gain.weight = hf_model.model.norm.weight  # type: ignore
+        # LM HEAD
+        model.lm_head.weight = hf_model.lm_head.weight
+
+        return model
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--config_file", type=str)
+    parser.add_argument("--model_id", type=str, default="meta-llama/Llama-3.2-1B")
 
     args = parser.parse_args()
-
-    with open(args.config_file, "r") as f:
-        config = yaml.safe_load(f)
-
-    llama_config = LlamaConfig(**config)
 
     device = torch.device(
         "cuda"
@@ -268,20 +297,23 @@ if __name__ == "__main__":
         else "cpu"
     )
 
-    token_ids = torch.randint(
-        0, llama_config.vocab_size, (llama_config.batch_size, llama_config.seq_len)
-    )
-
-    model = LlamaModel(config=llama_config)
-
-    model = model.to(device)
-
-    token_ids = token_ids.to(device)
-
-    logits = model(token_ids)
-
-    assert logits.shape == (
-        llama_config.batch_size,
-        llama_config.seq_len,
-        llama_config.vocab_size,
-    )
+    model = Llama.from_pretrained(model_id=args.model_id)
+    print(model)
+    # hf_model = AutoModelForCausalLM.from_pretrained(args.model_id)
+    #
+    # tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    #
+    # prompt = "What is the capital of France ?"
+    # input_ids = tokenizer.encode(prompt, return_tensors="pt")
+    #
+    # hf_logits = hf_model(input_ids)
+    # last_hf_token = hf_logits.logits[:, -1, :]
+    # hf_pref_token = torch.argmax(last_hf_token, dim=-1)
+    #
+    # print(hf_pref_token)
+    #
+    # logits = model(input_ids)
+    # last_token = logits[:, -1, :]
+    # pref_token = torch.argmax(last_token, dim=-1)
+    #
+    # print(pref_token)
