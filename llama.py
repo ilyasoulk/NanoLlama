@@ -1,5 +1,19 @@
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
+
+
+@dataclass
+class LlamaConfig:
+    d_model: int
+    vocab_size: int
+    kv_heads: int
+    q_heads: int
+    d_head: int
+    num_layers: int
+    seq_len: int
+    causal: bool = False
 
 
 class Swiglu(nn.Module):
@@ -69,7 +83,7 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         rms = torch.mean(x**2, keepdim=True, dim=-1).sqrt()
-        return (x / rms + self.eps) * self.gain
+        return (x / (rms + self.eps)) * self.gain
 
 
 class SelfAttention(nn.Module):
@@ -100,7 +114,11 @@ class SelfAttention(nn.Module):
         if self.causal:
             attn_scores.masked_fill(self.mask == 0, float("-inf"))
 
-        return attn_scores.softmax(-1) @ V
+        attn_scores = attn_scores.softmax(dim=-1) @ V  # (B, N_head, S, d_head)
+
+        attn_scores = attn_scores.transpose(1, 2)  # (B, S, N_head, d_head)
+
+        return attn_scores
 
 
 class GroupedQueryAttention(nn.Module):
@@ -189,28 +207,20 @@ class Encoder(nn.Module):
 
 
 class LLama(nn.Module):
-    def __init__(
-        self,
-        num_layers: int,
-        d_model: int,
-        vocab_size: int,
-        d_head: int,
-        kv_heads: int,
-        q_heads: int,
-        seq_len: int,
-        causal: bool = False,
-    ) -> None:
+    def __init__(self, config: LlamaConfig) -> None:
         super().__init__()
-        self.embeddings = nn.Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
+        self.embeddings = nn.Embedding(
+            num_embeddings=config.vocab_size, embedding_dim=config.d_model
+        )
 
         self.seq = nn.Sequential(*[
             Encoder(
-                d_model=d_model,
-                d_head=d_head,
-                kv_heads=kv_heads,
-                q_heads=q_heads,
-                seq_len=seq_len,
-                causal=causal,
+                d_model=config.d_model,
+                d_head=config.d_head,
+                kv_heads=config.kv_heads,
+                q_heads=config.q_heads,
+                seq_len=config.seq_len,
+                causal=config.causal,
             )
             for _ in range(num_layers)
         ])
@@ -245,9 +255,8 @@ if __name__ == "__main__":
     d_head = 32
     kv_heads = 4
     q_heads = 8
-    token_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
 
-    model = LLama(
+    config = LlamaConfig(
         num_layers=num_layers,
         d_model=d_model,
         vocab_size=vocab_size,
@@ -256,6 +265,9 @@ if __name__ == "__main__":
         q_heads=q_heads,
         seq_len=seq_len,
     )
+    token_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+
+    model = LLama(config=config)
 
     model = model.to(device)
 
