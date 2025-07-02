@@ -16,7 +16,12 @@ class LlamaConfig:
     causal: bool = False
 
 
-# TODO : Implement SiLU
+class SiLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * torch.sigmoid(x)
 
 
 class Swiglu(nn.Module):
@@ -33,17 +38,15 @@ class Swiglu(nn.Module):
 
 class LlamaMLP(nn.Module):
     def __init__(self, d_model: int) -> None:
-        # TODO : gate proj ?
-        # TODO : SiLU activation
         super().__init__()
+        self.gate_proj = nn.Linear(d_model, 2 * d_model)
         self.up_proj = nn.Linear(d_model, 2 * d_model)
-        self.down_proj = nn.Linear(d_model, d_model)
-        self.swiglu = Swiglu(d_model=d_model)
+        self.down_proj = nn.Linear(2 * d_model, d_model)
+        self.act_fn = SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_up = self.up_proj(x)
-        activations = self.swiglu(x_up)
-        return self.down_proj(activations)
+        x_up = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        return self.down_proj(x_up)
 
 
 class ROPE(nn.Module):
@@ -67,15 +70,9 @@ class ROPE(nn.Module):
         )  # (1, S, 1, 1, D/2)
 
         x1, x2 = x_complex.unbind(-1)
-        # import ipdb
-        #
-        # ipdb.set_trace()
-        x1_pos = x1 * cos - x2 * sin
-        x2_pos = x1 * sin + x2 * cos
-        # out = torch.stack(
-        #     (x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1
-        # )  # (B, S, N_head, D_head // 2, 2)
-        out = torch.stack((x1_pos, x2_pos), dim=-1)
+        out = torch.stack(
+            (x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1
+        )  # (B, S, N_head, D_head // 2, 2)
 
         return out.flatten(-2)  # (B, S, N_head, D_head)
 
@@ -241,7 +238,6 @@ class LlamaModel(nn.Module):
 
         x_norm = self.norm(x_out)
 
-        # TODO : investigate rotary emb here.
         return self.lm_head(x_norm)
 
 
