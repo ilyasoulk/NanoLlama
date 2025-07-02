@@ -166,7 +166,7 @@ class GroupedQueryAttention(nn.Module):
                 attn_scores.masked_fill(self.mask == 0, float("-inf"))
             attn = attn_scores.softmax(dim=-1) @ V  # (B, N_head, S, d_head)
             attn = attn.transpose(1, 2)  # (B, S, N_head, d_head)
-            attn = attn.view(B, seq_len, d_model)
+            attn = attn.reshape(B, seq_len, d_model)
 
         return self.o_proj(attn)
 
@@ -196,7 +196,7 @@ class LlamaDecoderLayer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_norm = self.input_layernorm(x)
-        attn = self.GQA(x_norm)
+        attn = self.self_attn(x_norm)
         attn += x
 
         ffn_norm = self.post_attention_layernorm(attn)
@@ -271,10 +271,6 @@ if __name__ == "__main__":
     model = LlamaModel(config=config)
 
     model = model.to(device)
-
-    import ipdb
-
-    ipdb.set_trace()
 
     token_ids = token_ids.to(device)
 
