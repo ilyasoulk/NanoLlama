@@ -16,6 +16,9 @@ class LlamaConfig:
     causal: bool = False
 
 
+# TODO : Implement SiLU
+
+
 class Swiglu(nn.Module):
     def __init__(self, d_model: int):
         super().__init__()
@@ -28,17 +31,19 @@ class Swiglu(nn.Module):
         return a * (b * torch.sigmoid(b))
 
 
-class MLP(nn.Module):
+class LlamaMLP(nn.Module):
     def __init__(self, d_model: int) -> None:
+        # TODO : gate proj ?
+        # TODO : SiLU activation
         super().__init__()
         self.up_proj = nn.Linear(d_model, 2 * d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
+        self.down_proj = nn.Linear(d_model, d_model)
         self.swiglu = Swiglu(d_model=d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_up = self.up_proj(x)
         activations = self.swiglu(x_up)
-        return self.out_proj(activations)
+        return self.down_proj(activations)
 
 
 class ROPE(nn.Module):
@@ -131,6 +136,7 @@ class GroupedQueryAttention(nn.Module):
         seq_len: int,
         causal: bool = False,
     ) -> None:
+        # TODO : find the d_head (q_heads and kv_heads for the llama 3.2 1b)
         super().__init__()
         assert q_heads > kv_heads
         assert q_heads % kv_heads == 0
@@ -139,27 +145,28 @@ class GroupedQueryAttention(nn.Module):
         self.kv_heads = kv_heads
         self.d_head = d_head
 
-        self.W_q = nn.Linear(d_model, q_heads * d_head)
-        self.W_kv = nn.Linear(d_model, 2 * kv_heads * d_head)
+        self.q_proj = nn.Linear(d_model, q_heads * d_head)
+        self.k_proj = nn.Linear(d_model, kv_heads * d_head)
+        self.v_proj = nn.Linear(d_model, kv_heads * d_head)
 
-        self.rope = ROPE(d_head=d_head)
+        self.rotary_emb = ROPE(d_head=d_head)
         self.self_attn = SelfAttention(seq_len=seq_len, causal=causal)
 
-        self.W_out = nn.Linear(d_model, d_model)
+        self.o_proj = nn.Linear(d_model, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, seq_len, d_model = x.shape
 
-        Q = self.W_q(x)
-        kv = self.W_kv(x)
-        K, V = kv.chunk(2, dim=-1)
+        Q = self.q_proj(x)
+        K = self.k_proj(x)
+        V = self.v_proj(x)
 
         Q = Q.reshape(B, seq_len, self.q_heads, self.d_head)
         K = K.reshape(B, seq_len, self.kv_heads, self.d_head)
         V = V.reshape(B, seq_len, self.kv_heads, self.d_head)
 
-        Q = self.rope(Q)
-        K = self.rope(K)
+        Q = self.rotary_emb(Q)
+        K = self.rotary_emb(K)
 
         K = K.repeat_interleave(self.q_heads // self.kv_heads, dim=2)
         V = V.repeat_interleave(self.q_heads // self.kv_heads, dim=2)
@@ -168,10 +175,10 @@ class GroupedQueryAttention(nn.Module):
 
         attn = attn.reshape(B, seq_len, d_model)
 
-        return self.W_out(attn)
+        return self.o_proj(attn)
 
 
-class Encoder(nn.Module):
+class LlamaDecoderLayer(nn.Module):
     def __init__(
         self,
         d_model: int,
@@ -182,8 +189,8 @@ class Encoder(nn.Module):
         causal: bool = False,
     ) -> None:
         super().__init__()
-        self.attn_norm = RMSNorm(d_model=d_model)
-        self.ffn_norm = RMSNorm(d_model=d_model)
+        self.input_layernorm = RMSNorm(d_model=d_model)
+        self.post_attention_layernorm = RMSNorm(d_model=d_model)
         self.GQA = GroupedQueryAttention(
             d_model=d_model,
             d_head=d_head,
@@ -192,29 +199,29 @@ class Encoder(nn.Module):
             seq_len=seq_len,
             causal=causal,
         )
-        self.ffn = MLP(d_model=d_model)
+        self.ffn = LlamaMLP(d_model=d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_norm = self.attn_norm(x)
+        x_norm = self.input_layernorm(x)
         attn = self.GQA(x_norm)
         attn += x
 
-        ffn_norm = self.ffn_norm(attn)
+        ffn_norm = self.post_attention_layernorm(attn)
         ffn_out = self.ffn(ffn_norm)
         ffn_out += attn
 
         return ffn_out
 
 
-class LLama(nn.Module):
+class LlamaModel(nn.Module):
     def __init__(self, config: LlamaConfig) -> None:
         super().__init__()
-        self.embeddings = nn.Embedding(
+        self.embed_tokens = nn.Embedding(
             num_embeddings=config.vocab_size, embedding_dim=config.d_model
         )
 
-        self.seq = nn.Sequential(*[
-            Encoder(
+        self.layers = nn.Sequential(*[
+            LlamaDecoderLayer(
                 d_model=config.d_model,
                 d_head=config.d_head,
                 kv_heads=config.kv_heads,
@@ -225,16 +232,17 @@ class LLama(nn.Module):
             for _ in range(num_layers)
         ])
         self.norm = RMSNorm(d_model=d_model)
-        self.out = nn.Linear(d_model, vocab_size, bias=False)
-        self.out.weight = self.embeddings.weight
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head.weight = self.embed_tokens.weight
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_emb = self.embeddings(x)
-        x_out = self.seq(x_emb)
+        x_emb = self.embed_tokens(x)
+        x_out = self.layers(x_emb)
 
         x_norm = self.norm(x_out)
 
-        return self.out(x_norm)
+        # TODO : investigate rotary emb here.
+        return self.lm_head(x_norm)
 
 
 if __name__ == "__main__":
@@ -267,7 +275,7 @@ if __name__ == "__main__":
     )
     token_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
 
-    model = LLama(config=config)
+    model = LlamaModel(config=config)
 
     model = model.to(device)
 
