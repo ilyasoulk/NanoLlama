@@ -1,3 +1,4 @@
+from typing import Tuple, Union
 import yaml
 import argparse
 from dataclasses import dataclass
@@ -182,6 +183,7 @@ class LlamaDecoderLayer(nn.Module):
         kv_heads: int,
         q_heads: int,
         seq_len: int,
+        rms_norm_eps: float,
         causal: bool = False,
         do_flash: bool = False,
     ) -> None:
@@ -196,8 +198,8 @@ class LlamaDecoderLayer(nn.Module):
             do_flash=do_flash,
         )
         self.mlp = LlamaMLP(d_model=d_model)
-        self.input_layernorm = RMSNorm(d_model=d_model)
-        self.post_attention_layernorm = RMSNorm(d_model=d_model)
+        self.input_layernorm = RMSNorm(d_model=d_model, eps=rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(d_model=d_model, eps=rms_norm_eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_norm = self.input_layernorm(x)
@@ -225,21 +227,30 @@ class Llama(nn.Module):
                 kv_heads=config.kv_heads,
                 q_heads=config.q_heads,
                 seq_len=config.seq_len,
+                rms_norm_eps=config.rms_norm_eps,
                 causal=config.causal,
                 do_flash=config.do_flash,
             )
             for _ in range(config.num_layers)
         ])
-        self.norm = RMSNorm(d_model=config.d_model)
+        self.norm = RMSNorm(d_model=config.d_model, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.lm_head.weight = self.embed_tokens.weight
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, output_hidden_states: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, list]]:
+        hidden_states = list()
         x_emb = self.embed_tokens(x)
         for layer in self.layers:
+            if output_hidden_states:
+                hidden_states.append(x_emb)
             x_emb = layer(x_emb)
 
         x_norm = self.norm(x_emb)
+
+        if output_hidden_states:
+            return self.lm_head(x_norm), hidden_states
 
         return self.lm_head(x_norm)
 
@@ -299,21 +310,34 @@ if __name__ == "__main__":
 
     model = Llama.from_pretrained(model_id=args.model_id)
     print(model)
-    # hf_model = AutoModelForCausalLM.from_pretrained(args.model_id)
-    #
-    # tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-    #
-    # prompt = "What is the capital of France ?"
-    # input_ids = tokenizer.encode(prompt, return_tensors="pt")
-    #
-    # hf_logits = hf_model(input_ids)
-    # last_hf_token = hf_logits.logits[:, -1, :]
-    # hf_pref_token = torch.argmax(last_hf_token, dim=-1)
-    #
-    # print(hf_pref_token)
-    #
-    # logits = model(input_ids)
-    # last_token = logits[:, -1, :]
-    # pref_token = torch.argmax(last_token, dim=-1)
-    #
-    # print(pref_token)
+    hf_model = AutoModelForCausalLM.from_pretrained(args.model_id)
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+
+    prompt = "What is the capital of France ?"
+    input_ids = tokenizer.encode(prompt, return_tensors="pt")
+
+    hf_logits = hf_model(input_ids, output_hidden_states=True)
+    hf_hidden_states = hf_logits.hidden_states
+    last_hf_token = hf_logits.logits[:, -1, :]
+    hf_pref_token = torch.argmax(last_hf_token, dim=-1)
+
+    print(hf_pref_token)
+
+    logits, hidden_states = model(input_ids, output_hidden_states=True)
+    last_token = logits[:, -1, :]
+    pref_token = torch.argmax(last_token, dim=-1)
+
+    print(pref_token)
+    print(
+        f"Predicted token using HF model : {hf_pref_token}",
+        f"Predicted token using our model : {pref_token}",
+    )
+
+    print(last_hf_token - last_token)
+    i = 0
+
+    for hf_layer, torch_layer in zip(hf_hidden_states, hidden_states):
+        print(f"Layer : {i}")
+        torch.testing.assert_close(torch_layer, hf_layer)
+        i += 1
