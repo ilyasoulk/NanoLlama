@@ -1,0 +1,13 @@
+d_model : 576
+intermediate_size : 1536
+vocab_size : 49152
+d_head : 64
+q_heads : 9
+num_layers : 30
+kv_heads : 3
+rms_norm_eps : 0.00001
+rope_theta : 100000.0
+seq_len : 10
+causal: True
+batch_size: 1
+do_flash: True
