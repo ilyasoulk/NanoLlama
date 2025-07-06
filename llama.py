@@ -1,5 +1,5 @@
+import math
 from typing import Tuple, Union
-import ipdb
 import yaml
 import argparse
 from dataclasses import dataclass
@@ -7,14 +7,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-
-def get_activation(name, activations):
-    def hook(module, input, output):
-        # Store the linear projection output (before RoPE)
-        activations[name] = output
-
-    return hook
 
 
 @dataclass
@@ -60,7 +52,9 @@ class LlamaMLP(nn.Module):
         self.gate_proj = nn.Linear(d_model, intermediate_size, bias=False)
         self.up_proj = nn.Linear(d_model, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, d_model, bias=False)
-        self.act_fn = SiLU()
+        # self.act_fn = SiLU() # This doesn't work with the HF implem, might need to check torch._C._nn.silu...
+        # https://github.com/pytorch/pytorch/blob/v2.7.0/torch/nn/functional.py#L2358
+        self.act_fn = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_up = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
@@ -86,8 +80,10 @@ class ROPE(nn.Module):
         return torch.cat((-x2, x1), dim=-1)
 
     @torch.no_grad()
-    def forward(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-        B, N_head, S, D_head = q.shape
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        S = q.size(2)
         pos = torch.arange(0, S, device=q.device, dtype=torch.float32)  # (S,)
         theta = torch.outer(pos, self.inv_freq)  # (S, D / 2)
         theta = torch.cat((theta, theta), dim=-1)
@@ -96,21 +92,10 @@ class ROPE(nn.Module):
             theta.sin()[None, None, :, :],
         )  # (1, 1, S, D/2)
 
-        out = torch.rand(B, N_head, S, D_head)
-
         q_rot = (q * cos) + (self.rotate_half(q) * sin)
         k_rot = (k * cos) + (self.rotate_half(k) * sin)
 
-        return q_rot, k_rot, cos, sin
-
-        # # x1, x2 = x_complex.unbind(-1)
-        # # out = torch.stack(
-        # #     (x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1
-        # # )  # (B, S, N_head, D_head // 2, 2)
-        # #
-        # # out = out.to(input_dtype)
-        #
-        # return out.flatten(-2), cos, sin  # (B, S, N_head, D_head)
+        return q_rot, k_rot
 
 
 class RMSNorm(nn.Module):
@@ -160,15 +145,9 @@ class GroupedQueryAttention(nn.Module):
 
         self.causal = causal
         self.do_flash = do_flash
-        # if self.causal:
-        #     self.register_buffer(
-        #         "mask", torch.tril(torch.ones((seq_len, seq_len)))[None, None, :, :]
-        #     )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, seq_len, d_model = x.shape
-
-        mask = torch.tril(torch.ones((seq_len, seq_len)))[None, None, :, :]
 
         Q = self.q_proj(x)
         K = self.k_proj(x)
@@ -182,29 +161,45 @@ class GroupedQueryAttention(nn.Module):
         K = K.transpose(1, 2)  # (B, N_head, S, D_head)
         V = V.transpose(1, 2)  # (B, N_head, S, D_head)
 
-        Q_rot, K_rot, cos, sin = self.rotary_emb(Q, K)
+        Q_rot, K_rot = self.rotary_emb(Q, K)
 
-        K = K_rot.repeat_interleave(self.q_heads // self.kv_heads, dim=1)
+        # This could be removed and setting enable_gqa in sdpa
+        K_rot = K_rot.repeat_interleave(self.q_heads // self.kv_heads, dim=1)
         V = V.repeat_interleave(self.q_heads // self.kv_heads, dim=1)
 
         if self.do_flash:
             attn = torch.nn.functional.scaled_dot_product_attention(
                 query=Q_rot,
-                key=K,
+                key=K_rot,
                 value=V,
                 is_causal=self.causal,
             )
         else:
-            attn_scores = (
-                Q_rot @ K.transpose(-1, -2) / self.d_head**0.5
-            )  # (B, N_head, S, S)
+            # Set do_flash to true for now
+            # Investigate why my own attention doesn't pass the tests,
+            # maybe take a look at
+            # https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
+            attn_bias = torch.zeros(
+                (seq_len, seq_len), device=Q_rot.device, dtype=Q_rot.dtype
+            )
             if self.causal:
-                attn_scores = attn_scores.masked_fill(mask == 0, float("-inf"))
+                mask = torch.tril(
+                    torch.ones(
+                        (seq_len, seq_len), device=Q_rot.device, dtype=torch.bool
+                    ),
+                    diagonal=0,
+                )
+                attn_bias.masked_fill_(mask.logical_not(), float("-inf"))
+                attn_bias.to(Q_rot.dtype)
+
+            scale = 1 / math.sqrt(self.d_head)
+            attn_scores = Q_rot @ K_rot.transpose(-1, -2) * scale  # (B, N_head, S, S)
+            attn_scores += attn_bias
             attn = attn_scores.softmax(dim=-1) @ V  # (B, N_head, S, d_head)
 
         attn = attn.transpose(1, 2).contiguous()  # (B, S, N_head, d_head)
         attn = attn.reshape(B, seq_len, d_model)
-        return self.o_proj(attn), Q_rot, K_rot, cos, sin
+        return self.o_proj(attn)
 
 
 class LlamaDecoderLayer(nn.Module):
@@ -238,14 +233,14 @@ class LlamaDecoderLayer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_norm = self.input_layernorm(x)
-        attn, q, k, cos, sin = self.self_attn(x_norm)
+        attn = self.self_attn(x_norm)
         attn += x
 
         ffn_norm = self.post_attention_layernorm(attn)
         ffn_out = self.mlp(ffn_norm)
         ffn_out += attn
 
-        return ffn_out, q, k, cos, sin
+        return ffn_out
 
 
 class Llama(nn.Module):
@@ -279,23 +274,17 @@ class Llama(nn.Module):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, list]]:
         hidden_states = list()
         x_emb = self.embed_tokens(x)
-        queries, keys = [], []
-        coss, sins = [], []
         for layer in self.layers:
             if output_hidden_states:
                 hidden_states.append(x_emb)
-            x_emb, q, k, cos, sin = layer(x_emb)
-            coss.append(cos)
-            sins.append(sin)
-            queries.append(q)
-            keys.append(k)
+            x_emb = layer(x_emb)
 
         x_norm = self.norm(x_emb)
 
         if output_hidden_states:
             return self.lm_head(x_norm), hidden_states
 
-        return self.lm_head(x_norm), queries, keys, cos, sin
+        return self.lm_head(x_norm)
 
     @classmethod
     def from_pretrained(cls, model_id: str) -> nn.Module:
@@ -304,7 +293,9 @@ class Llama(nn.Module):
 
         llama_config = LlamaConfig(**config)
         model = cls(config=llama_config)
+        model = model.to(torch.float32)
         hf_model = AutoModelForCausalLM.from_pretrained(model_id)
+        hf_model = hf_model.to(torch.float32)
 
         # EMBEDDING TOKENS
         model.embed_tokens.weight.data = hf_model.model.embed_tokens.weight.data.clone()
@@ -354,18 +345,20 @@ class Llama(nn.Module):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-
     parser.add_argument("--model_id", type=str, default="meta-llama/Llama-3.2-1B")
-
+    parser.add_argument("--device", type=str, default=None)
     args = parser.parse_args()
 
-    device = torch.device(
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.mps.is_available()
-        else "cpu"
-    )
+    if args.device is None:
+        device = torch.device(
+            "cuda"
+            if torch.cuda.is_available()
+            else "mps"
+            if torch.mps.is_available()
+            else "cpu"
+        )
+    else:
+        device = torch.device(args.device)
 
     model = Llama.from_pretrained(model_id=args.model_id)
     hf_model = AutoModelForCausalLM.from_pretrained(args.model_id)
@@ -373,32 +366,6 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
 
     layer_idx = 0
-    hf_activations = {}
-    activations = {}
-
-    hf_model.model.layers[layer_idx].self_attn.q_proj.register_forward_hook(
-        get_activation(f"layer_{layer_idx}_q_proj", hf_activations)
-    )
-    hf_model.model.layers[layer_idx].self_attn.k_proj.register_forward_hook(
-        get_activation(f"layer_{layer_idx}_k_proj", hf_activations)
-    )
-
-    model.layers[layer_idx].self_attn.q_proj.register_forward_hook(
-        get_activation(f"layer_{layer_idx}_q_proj", activations)
-    )
-    model.layers[layer_idx].self_attn.k_proj.register_forward_hook(
-        get_activation(f"layer_{layer_idx}_k_proj", activations)
-    )
-
-    hf_model.model.layers[layer_idx].self_attn.register_forward_hook(
-        get_activation(f"layer_{layer_idx}_self_attn", hf_activations)
-    )
-
-    model.layers[layer_idx].self_attn.register_forward_hook(
-        get_activation(f"layer_{layer_idx}_self_attn", activations)
-    )
-
-    print(model)
 
     prompt = "What is the capital of france ?"
     input_ids = tokenizer.encode(prompt, return_tensors="pt")
@@ -406,39 +373,11 @@ if __name__ == "__main__":
     logits, hidden_states = model(input_ids, output_hidden_states=True)
     outputs = hf_model(input_ids, output_hidden_states=True, return_dict=True)
 
-    hf_queries, hf_keys = outputs[1], outputs[2]
-    hf_coss, hf_sins = outputs[3], outputs[4]
-    hf_hidden_states = outputs[0].hidden_states
+    hf_hidden_states = outputs.hidden_states
 
-    # hf_first_query = hf_queries[0]
-    # first_query = queries[0]
-    #
-    # torch.testing.assert_close(coss[0], hf_coss[0])
-    # torch.testing.assert_close(sins[0], hf_sins[0])
-    #
-    # # __import__("ipdb").set_trace()
-    # torch.testing.assert_close(queries[0], hf_queries[0])
-
-    # print(hf_activations.keys())
-    # print(activations.keys())
-    #
-    # torch.testing.assert_close(
-    #     activations[f"layer_{layer_idx}_q_proj"],
-    #     hf_activations[f"layer_{layer_idx}_q_proj"],
-    # )
-    # torch.testing.assert_close(
-    #     activations[f"layer_{layer_idx}_k_proj"],
-    #     hf_activations[f"layer_{layer_idx}_k_proj"],
-    # )
-    # #
-    # torch.testing.assert_close(
-    #     activations[f"layer_{layer_idx}_self_attn"],
-    #     hf_activations[f"layer_{layer_idx}_self_attn"][0],
-    # )
-    # print(logits.shape, outputs[0].logits.shape)
-    # torch.testing.assert_close(logits, outputs[0].logits)
-    #
     for hf_layer, torch_layer in zip(hf_hidden_states, hidden_states):
         print(f"Layer : {layer_idx}")
         torch.testing.assert_close(torch_layer, hf_layer, rtol=1e-4, atol=1e-5)
         layer_idx += 1
+
+    torch.testing.assert_close(logits, outputs.logits)
