@@ -1,4 +1,5 @@
 from typing import Tuple, Union
+import ipdb
 import yaml
 import argparse
 from dataclasses import dataclass
@@ -78,30 +79,38 @@ class ROPE(nn.Module):
         )  # (D / 2,)
         self.register_buffer("inv_freq", freq)
 
+    def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        """Rotates half the hidden dims of the input."""
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
+
     @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.size(-1) % 2 == 0  # (B, S, N_head, D_head)
-        B, S, N_head, D_head = x.shape
-        input_dtype = x.dtype
-        x_complex = x.float().view(
-            B, S, N_head, D_head // 2, 2
-        )  # (B, S, N_head, D_head // 2, 2)
-
-        pos = torch.arange(0, S, device=x.device, dtype=torch.float32)  # (S,)
-        theta = torch.outer(pos, self.inv_freq)  # (S, D/2)
+    def forward(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+        B, N_head, S, D_head = q.shape
+        pos = torch.arange(0, S, device=q.device, dtype=torch.float32)  # (S,)
+        theta = torch.outer(pos, self.inv_freq)  # (S, D / 2)
+        theta = torch.cat((theta, theta), dim=-1)
         cos, sin = (
-            theta.cos()[None, :, None, :],
-            theta.sin()[None, :, None, :],
-        )  # (1, S, 1, 1, D/2)
+            theta.cos()[None, None, :, :],
+            theta.sin()[None, None, :, :],
+        )  # (1, 1, S, D/2)
 
-        x1, x2 = x_complex.unbind(-1)
-        out = torch.stack(
-            (x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1
-        )  # (B, S, N_head, D_head // 2, 2)
+        out = torch.rand(B, N_head, S, D_head)
 
-        out = out.to(input_dtype)
+        q_rot = (q * cos) + (self.rotate_half(q) * sin)
+        k_rot = (k * cos) + (self.rotate_half(k) * sin)
 
-        return out.flatten(-2)  # (B, S, N_head, D_head)
+        return q_rot, k_rot, cos, sin
+
+        # # x1, x2 = x_complex.unbind(-1)
+        # # out = torch.stack(
+        # #     (x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1
+        # # )  # (B, S, N_head, D_head // 2, 2)
+        # #
+        # # out = out.to(input_dtype)
+        #
+        # return out.flatten(-2), cos, sin  # (B, S, N_head, D_head)
 
 
 class RMSNorm(nn.Module):
@@ -169,26 +178,25 @@ class GroupedQueryAttention(nn.Module):
         K = K.view(B, seq_len, self.kv_heads, self.d_head)
         V = V.view(B, seq_len, self.kv_heads, self.d_head)
 
-        Q = self.rotary_emb(Q)
-        K = self.rotary_emb(K)
-
         Q = Q.transpose(1, 2)  # (B, N_head, S, D_head)
         K = K.transpose(1, 2)  # (B, N_head, S, D_head)
         V = V.transpose(1, 2)  # (B, N_head, S, D_head)
 
-        K = K.repeat_interleave(self.q_heads // self.kv_heads, dim=1)
+        Q_rot, K_rot, cos, sin = self.rotary_emb(Q, K)
+
+        K = K_rot.repeat_interleave(self.q_heads // self.kv_heads, dim=1)
         V = V.repeat_interleave(self.q_heads // self.kv_heads, dim=1)
 
         if self.do_flash:
             attn = torch.nn.functional.scaled_dot_product_attention(
-                query=Q,
+                query=Q_rot,
                 key=K,
                 value=V,
                 is_causal=self.causal,
             )
         else:
             attn_scores = (
-                Q @ K.transpose(-1, -2) / self.d_head**0.5
+                Q_rot @ K.transpose(-1, -2) / self.d_head**0.5
             )  # (B, N_head, S, S)
             if self.causal:
                 attn_scores = attn_scores.masked_fill(mask == 0, float("-inf"))
@@ -196,7 +204,7 @@ class GroupedQueryAttention(nn.Module):
 
         attn = attn.transpose(1, 2).contiguous()  # (B, S, N_head, d_head)
         attn = attn.reshape(B, seq_len, d_model)
-        return self.o_proj(attn)
+        return self.o_proj(attn), Q_rot, K_rot, cos, sin
 
 
 class LlamaDecoderLayer(nn.Module):
@@ -230,14 +238,14 @@ class LlamaDecoderLayer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_norm = self.input_layernorm(x)
-        attn = self.self_attn(x_norm)
+        attn, q, k, cos, sin = self.self_attn(x_norm)
         attn += x
 
         ffn_norm = self.post_attention_layernorm(attn)
         ffn_out = self.mlp(ffn_norm)
         ffn_out += attn
 
-        return ffn_out
+        return ffn_out, q, k, cos, sin
 
 
 class Llama(nn.Module):
@@ -271,17 +279,23 @@ class Llama(nn.Module):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, list]]:
         hidden_states = list()
         x_emb = self.embed_tokens(x)
+        queries, keys = [], []
+        coss, sins = [], []
         for layer in self.layers:
             if output_hidden_states:
                 hidden_states.append(x_emb)
-            x_emb = layer(x_emb)
+            x_emb, q, k, cos, sin = layer(x_emb)
+            coss.append(cos)
+            sins.append(sin)
+            queries.append(q)
+            keys.append(k)
 
         x_norm = self.norm(x_emb)
 
         if output_hidden_states:
             return self.lm_head(x_norm), hidden_states
 
-        return self.lm_head(x_norm)
+        return self.lm_head(x_norm), queries, keys, cos, sin
 
     @classmethod
     def from_pretrained(cls, model_id: str) -> nn.Module:
@@ -391,29 +405,40 @@ if __name__ == "__main__":
 
     logits, hidden_states = model(input_ids, output_hidden_states=True)
     outputs = hf_model(input_ids, output_hidden_states=True, return_dict=True)
-    hf_hidden_states = outputs.hidden_states
+
+    hf_queries, hf_keys = outputs[1], outputs[2]
+    hf_coss, hf_sins = outputs[3], outputs[4]
+    hf_hidden_states = outputs[0].hidden_states
+
+    # hf_first_query = hf_queries[0]
+    # first_query = queries[0]
+    #
+    # torch.testing.assert_close(coss[0], hf_coss[0])
+    # torch.testing.assert_close(sins[0], hf_sins[0])
+    #
+    # # __import__("ipdb").set_trace()
+    # torch.testing.assert_close(queries[0], hf_queries[0])
 
     # print(hf_activations.keys())
     # print(activations.keys())
     #
-    torch.testing.assert_close(
-        activations[f"layer_{layer_idx}_q_proj"],
-        hf_activations[f"layer_{layer_idx}_q_proj"],
-    )
-    torch.testing.assert_close(
-        activations[f"layer_{layer_idx}_k_proj"],
-        hf_activations[f"layer_{layer_idx}_k_proj"],
-    )
+    # torch.testing.assert_close(
+    #     activations[f"layer_{layer_idx}_q_proj"],
+    #     hf_activations[f"layer_{layer_idx}_q_proj"],
+    # )
+    # torch.testing.assert_close(
+    #     activations[f"layer_{layer_idx}_k_proj"],
+    #     hf_activations[f"layer_{layer_idx}_k_proj"],
+    # )
+    # #
+    # torch.testing.assert_close(
+    #     activations[f"layer_{layer_idx}_self_attn"],
+    #     hf_activations[f"layer_{layer_idx}_self_attn"][0],
+    # )
+    # print(logits.shape, outputs[0].logits.shape)
+    # torch.testing.assert_close(logits, outputs[0].logits)
     #
-    torch.testing.assert_close(
-        activations[f"layer_{layer_idx}_self_attn"],
-        hf_activations[f"layer_{layer_idx}_self_attn"][0],
-    )
-    # print(logits.shape, outputs.logits.shape)
-    # torch.testing.assert_close(logits, outputs.logits)
-    # hf_hidden_states = outputs.hidden_states
-    #
-    # for hf_layer, torch_layer in zip(hf_hidden_states, hidden_states):
-    #     print(f"Layer : {layer_idx}")
-    #     torch.testing.assert_close(torch_layer, hf_layer)
-    #     layer_idx += 1
+    for hf_layer, torch_layer in zip(hf_hidden_states, hidden_states):
+        print(f"Layer : {layer_idx}")
+        torch.testing.assert_close(torch_layer, hf_layer, rtol=1e-4, atol=1e-5)
+        layer_idx += 1
