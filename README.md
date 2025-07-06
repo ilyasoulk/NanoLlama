@@ -7,6 +7,6 @@ Single file implementation of llama3 models with pre-training script
 
 - [x] Base architecture in pytorch
 - [x] Load hf weights into my implem
-- [ ] Tests
+- [x] Tests
 - [ ] Training script
 - [ ] Maybe FSDP
