@@ -9,7 +9,6 @@ Single file implementation of llama3 models with pre-training script
 - [x] Load hf weights into my implem
 - [x] Tests
 - [ ] Training script
-- [ ] Maybe FSDP
 
 # Test
 
