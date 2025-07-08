@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.library import custom_op
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -31,7 +33,14 @@ class SiLU(nn.Module):
         super().__init__()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * torch.sigmoid(x)
+        input_dtype = x.dtype
+        y = x.double()
+        return (y * F.sigmoid(y)).to(input_dtype)
+
+
+@custom_op("myops::silu", mutates_args=())
+def fused_silu(x: torch.Tensor) -> torch.Tensor:
+    return x * torch.sigmoid(x)
 
 
 class Swiglu(nn.Module):
@@ -52,12 +61,15 @@ class LlamaMLP(nn.Module):
         self.gate_proj = nn.Linear(d_model, intermediate_size, bias=False)
         self.up_proj = nn.Linear(d_model, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, d_model, bias=False)
-        # self.act_fn = SiLU() # This doesn't work with the HF implem, might need to check torch._C._nn.silu...
+        self.act_fn = SiLU()  # This doesn't work with the HF implem, might need to check torch._C._nn.silu...
+        # ongoing investigation, on cuda the drift is not as large, only breaks at 20 layers deep
+        # on fp64 it goes deeper
+        # self.act_fn.compile()
         # https://github.com/pytorch/pytorch/blob/v2.7.0/torch/nn/functional.py#L2358
-        self.act_fn = nn.SiLU()
+        # self.act_fn = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_up = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        x_up = F.silu(self.gate_proj(x)) * self.up_proj(x)
         return self.down_proj(x_up)
 
 
