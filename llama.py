@@ -20,12 +20,10 @@ class LlamaConfig:
     q_heads: int
     d_head: int
     num_layers: int
-    seq_len: int
     rms_norm_eps: float
     batch_size: int
     rope_theta: float
     causal: bool = False
-    do_flash: bool = False
 
 
 class SiLU(nn.Module):
@@ -36,11 +34,6 @@ class SiLU(nn.Module):
         input_dtype = x.dtype
         y = x.double()
         return (y * F.sigmoid(y)).to(input_dtype)
-
-
-@custom_op("myops::silu", mutates_args=())
-def fused_silu(x: torch.Tensor) -> torch.Tensor:
-    return x * torch.sigmoid(x)
 
 
 class Swiglu(nn.Module):
@@ -61,7 +54,7 @@ class LlamaMLP(nn.Module):
         self.gate_proj = nn.Linear(d_model, intermediate_size, bias=False)
         self.up_proj = nn.Linear(d_model, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, d_model, bias=False)
-        self.act_fn = SiLU()  # This doesn't work with the HF implem, might need to check torch._C._nn.silu...
+        # self.act_fn = SiLU()  # This doesn't work with the HF implem, might need to check torch._C._nn.silu...
         # ongoing investigation, on cuda the drift is not as large, only breaks at 20 layers deep
         # on fp64 it goes deeper
         # self.act_fn.compile()
@@ -76,14 +69,14 @@ class LlamaMLP(nn.Module):
 class ROPE(nn.Module):
     def __init__(self, d_head: int, base: float = 10_000.0) -> None:
         super().__init__()
-        freq = 1.0 / (
+        inv_freq = 1.0 / (
             (base)
             ** (
                 torch.arange(0, d_head, 2, dtype=torch.int64).to(dtype=torch.float)
                 / d_head
             )
         )  # (D / 2,)
-        self.register_buffer("inv_freq", freq)
+        self.register_buffer("inv_freq", inv_freq)
 
     def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
         """Rotates half the hidden dims of the input."""
@@ -135,10 +128,8 @@ class GroupedQueryAttention(nn.Module):
         d_head: int,
         kv_heads: int,
         q_heads: int,
-        seq_len: int,
         rope_theta: float,
         causal: bool = False,
-        do_flash: bool = False,
     ) -> None:
         super().__init__()
         assert q_heads > kv_heads
@@ -156,7 +147,6 @@ class GroupedQueryAttention(nn.Module):
         self.rotary_emb = ROPE(d_head=d_head, base=rope_theta)
 
         self.causal = causal
-        self.do_flash = do_flash
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, seq_len, d_model = x.shape
@@ -179,35 +169,12 @@ class GroupedQueryAttention(nn.Module):
         K_rot = K_rot.repeat_interleave(self.q_heads // self.kv_heads, dim=1)
         V = V.repeat_interleave(self.q_heads // self.kv_heads, dim=1)
 
-        if self.do_flash:
-            attn = torch.nn.functional.scaled_dot_product_attention(
-                query=Q_rot,
-                key=K_rot,
-                value=V,
-                is_causal=self.causal,
-            )
-        else:
-            # Set do_flash to true for now
-            # Investigate why my own attention doesn't pass the tests,
-            # maybe take a look at
-            # https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
-            attn_bias = torch.zeros(
-                (seq_len, seq_len), device=Q_rot.device, dtype=Q_rot.dtype
-            )
-            if self.causal:
-                mask = torch.tril(
-                    torch.ones(
-                        (seq_len, seq_len), device=Q_rot.device, dtype=torch.bool
-                    ),
-                    diagonal=0,
-                )
-                attn_bias.masked_fill_(mask.logical_not(), float("-inf"))
-                attn_bias.to(Q_rot.dtype)
-
-            scale = 1 / math.sqrt(self.d_head)
-            attn_scores = Q_rot @ K_rot.transpose(-1, -2) * scale  # (B, N_head, S, S)
-            attn_scores += attn_bias
-            attn = attn_scores.softmax(dim=-1) @ V  # (B, N_head, S, d_head)
+        attn = torch.nn.functional.scaled_dot_product_attention(
+            query=Q_rot,
+            key=K_rot,
+            value=V,
+            is_causal=self.causal,
+        )
 
         attn = attn.transpose(1, 2).contiguous()  # (B, S, N_head, d_head)
         attn = attn.reshape(B, seq_len, d_model)
@@ -222,11 +189,9 @@ class LlamaDecoderLayer(nn.Module):
         intermediate_size: int,
         kv_heads: int,
         q_heads: int,
-        seq_len: int,
         rms_norm_eps: float,
         rope_theta: float,
         causal: bool = False,
-        do_flash: bool = False,
     ) -> None:
         super().__init__()
         self.self_attn = GroupedQueryAttention(
@@ -234,10 +199,8 @@ class LlamaDecoderLayer(nn.Module):
             d_head=d_head,
             kv_heads=kv_heads,
             q_heads=q_heads,
-            seq_len=seq_len,
             rope_theta=rope_theta,
             causal=causal,
-            do_flash=do_flash,
         )
         self.mlp = LlamaMLP(d_model=d_model, intermediate_size=intermediate_size)
         self.input_layernorm = RMSNorm(d_model=d_model, eps=rms_norm_eps)
@@ -269,11 +232,9 @@ class Llama(nn.Module):
                 intermediate_size=config.intermediate_size,
                 kv_heads=config.kv_heads,
                 q_heads=config.q_heads,
-                seq_len=config.seq_len,
                 rms_norm_eps=config.rms_norm_eps,
                 rope_theta=config.rope_theta,
                 causal=config.causal,
-                do_flash=config.do_flash,
             )
             for _ in range(config.num_layers)
         ])
@@ -393,3 +354,5 @@ if __name__ == "__main__":
         layer_idx += 1
 
     torch.testing.assert_close(logits, outputs.logits)
+
+    print("Success")
