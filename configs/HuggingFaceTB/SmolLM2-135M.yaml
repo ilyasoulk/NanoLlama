@@ -7,7 +7,5 @@ num_layers : 30
 kv_heads : 3
 rms_norm_eps : 0.00001
 rope_theta : 100000 
-seq_len : 10 
 causal: True
 batch_size: 1
-do_flash: True

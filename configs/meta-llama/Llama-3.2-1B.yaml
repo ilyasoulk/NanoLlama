@@ -6,8 +6,6 @@ q_heads : 32
 kv_heads : 8
 rms_norm_eps : 0.00001
 rope_theta : 500000.0
-seq_len : 10
 causal: False
 batch_size: 1
-do_flash: False
 
