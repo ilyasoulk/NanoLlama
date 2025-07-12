@@ -1,0 +1,8 @@
+DATA:
+  HF_DATA_PATH: "roneneldan/TinyStories"
+  TOKENIZER_ID: "HuggingFaceTB/SmolLM2-135M"
+  SEQ_LEN: 128
+  DATA_PATH: "./data.bin"
+
+TRAIN:
+
