@@ -5,12 +5,16 @@ Single file implementation of llama3 models with pre-training script
 
 # TODO
 
-- [x] Base architecture in pytorch
-- [x] Load hf weights into my implem
-- [x] Tests
-- [ ] auto-regressive dataloader
+- [x] base architecture in pytorch
+- [x] load hf weights into my implem
+- [x] tests
+- [x] auto-regressive dataset
+- [ ] add wandb
+- [ ] simple pretrain run (cosine scheduler, adamw, grad clip, mix precision)
+- [ ] batch scheduling, custom dataloader ? control amount of token per batch...
 - [ ] WSD scheduler
-- [ ] first training runs
+- [ ] SGD with batch size 1
+- [ ] muon ?
 
 # Test
 
