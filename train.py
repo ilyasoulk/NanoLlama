@@ -1,12 +1,13 @@
 import os
-import torch
-from typing import Tuple
-import yaml
 import argparse
+from typing import Tuple
+
+import yaml
+import torch
 import numpy as np
 from datasets import load_dataset
-from transformers import AutoTokenizer
 from torch.utils.data import Dataset
+from transformers import AutoTokenizer
 
 
 class NextTokenDataset(Dataset):
