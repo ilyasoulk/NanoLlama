@@ -1,6 +1,13 @@
 import os
+import time
 import argparse
 from typing import Tuple
+
+from torch.utils.data.dataloader import DataLoader
+import torch.nn.functional as F
+
+
+from llama import Llama, LlamaConfig
 
 import yaml
 import torch
@@ -32,7 +39,8 @@ def create_bin(
     tokenizer_id: str,
     seq_len: int,
     num_samples: int = 10_000,
-    save_path: str = "data.bin",
+    save_path: str = "./data",
+    split: float = 0.8,
 ) -> None:
     dataset = load_dataset(data_path, split="train", streaming=True)
     data = list(dataset.take(num_samples))  # type: ignore
@@ -57,7 +65,13 @@ def create_bin(
     num_seq, r = divmod(num_tokens, seq_len)
 
     np_token_ids = np.array(token_ids[:-r], dtype=np.uint16).reshape(num_seq, seq_len)
-    np_token_ids.tofile(save_path)
+    split_idx = int(split * num_seq)
+    train_data = np_token_ids[:split_idx]
+    test_data = np_token_ids[split_idx:]
+
+    os.makedirs(save_path, exist_ok=True)
+    train_data.tofile(os.path.join(save_path, "train.bin"))
+    test_data.tofile(os.path.join(save_path, "test.bin"))
 
 
 if __name__ == "__main__":
@@ -68,17 +82,63 @@ if __name__ == "__main__":
     with open(args.config_file, "r") as f:
         config = yaml.safe_load(f)
 
-    if not os.path.exists(config["DATA"]["DATA_PATH"]):
+    if not os.path.exists(config["data"]["data_path"]):
         create_bin(
-            config["DATA"]["HF_DATA_PATH"],
-            config["DATA"]["TOKENIZER_ID"],
-            config["DATA"]["SEQ_LEN"],
-            save_path=config["DATA"]["DATA_PATH"],
+            config["data"]["hf_data_path"],
+            config["data"]["tokenizer_id"],
+            config["data"]["seq_len"],
+            save_path=config["data"]["data_path"],
         )
 
-    dataset = NextTokenDataset(
-        data_path=config["DATA"]["DATA_PATH"], seq_len=config["DATA"]["SEQ_LEN"]
+    train_dataset = NextTokenDataset(
+        data_path=config["data"]["train_data_path"], seq_len=config["data"]["seq_len"]
+    )
+    test_dataset = NextTokenDataset(
+        data_path=config["data"]["test_data_path"], seq_len=config["data"]["seq_len"]
+    )
+    train_loader = DataLoader(
+        train_dataset, batch_size=config["optim"]["batch_size"], shuffle=True
+    )
+    test_loader = DataLoader(test_dataset, batch_size=config["optim"]["batch_size"])
+
+    device = torch.device(config["device"])
+    llama_config = LlamaConfig(**config["llama_config"])
+    model = Llama(llama_config).to(device)
+    num_params = sum([p.numel() for p in model.parameters()])
+    print(f"Number of parameters : {num_params}")
+
+    optimizer = torch.optim.SGD(model.parameters(), config["optim"]["lr"])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, config["optim"]["t_max"]
     )
 
-    x, y = dataset[0]
-    print(x.shape, y.shape)
+    epochs = config["optim"]["epochs"]
+
+    tokens_per_batch = config["optim"]["batch_size"] * config["data"]["seq_len"]
+    num_batches = len(train_loader)
+
+    model = torch.compile(model)
+
+    for epoch in range(epochs):
+        train_loss = 0.0
+        start = time.time()
+        for i, (x, y) in enumerate(train_loader):
+            if i > 10:  # temp, for testing
+                num_batches = i - 1
+                break
+            x, y = x.to(device), y.to(device)
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+
+        end = time.time()
+        duration = end - start
+        avg_train_loss = train_loss / num_batches
+        tokens_per_second = (tokens_per_batch * num_batches) / duration
+        print(
+            f"Epoch: {epoch}, train loss : {avg_train_loss}, tokens/s : {tokens_per_second}"
+        )

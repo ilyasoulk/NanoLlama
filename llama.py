@@ -20,7 +20,6 @@ class LlamaConfig:
     d_head: int
     num_layers: int
     rms_norm_eps: float
-    batch_size: int
     rope_theta: float
     causal: bool = False
 

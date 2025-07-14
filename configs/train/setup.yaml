@@ -1,8 +1,27 @@
-DATA:
-  HF_DATA_PATH: "roneneldan/TinyStories"
-  TOKENIZER_ID: "HuggingFaceTB/SmolLM2-135M"
-  SEQ_LEN: 128
-  DATA_PATH: "./data.bin"
+data:
+  hf_data_path: "roneneldan/TinyStories"
+  tokenizer_id: "HuggingFaceTB/SmolLM2-135M"
+  seq_len: 128
+  data_path: "./data"
+  train_data_path: "./data/train.bin"
+  test_data_path: "./data/test.bin"
 
-TRAIN:
+llama_config:
+  d_model: 128
+  intermediate_size: 512
+  vocab_size: 49152
+  d_head: 32
+  q_heads: 4
+  num_layers: 10
+  kv_heads: 2
+  rms_norm_eps: 0.00001
+  rope_theta: 10000
+  causal: TRUE
 
+optim:
+  lr: 0.0001
+  epochs: 10
+  batch_size: 1
+  t_max: 5
+
+device: "mps"
