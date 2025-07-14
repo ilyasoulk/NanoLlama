@@ -9,12 +9,12 @@ Single file implementation of llama3 models with pre-training script
 - [x] load hf weights into my implem
 - [x] tests
 - [x] auto-regressive dataset
+- [x] simple pretrain script
+- [ ] fix huge abnormal loss (~120) should expect around log(vocab_size=49k) = ~10.8
 - [ ] add wandb
-- [ ] simple pretrain run (cosine scheduler, adamw, grad clip, mix precision)
+- [ ] try multiple optimizers sgd vs adamw vs muon, mixed precision
 - [ ] batch scheduling, custom dataloader ? control amount of token per batch...
 - [ ] WSD scheduler
-- [ ] SGD with batch size 1
-- [ ] muon ?
 
 # Test
 
@@ -24,6 +24,10 @@ git clone https://github.com/ilyasoulk/NanoLlama.git
 cd NanoLlama
 uv sync
 source .venv/bin/activate
+
 # Run SmolLM2-135M
 python llama.py --model_id HuggingFaceTB/SmolLM2-135M
+
+# Run pre-training
+python train.py --config_file configs/train/setup.yaml
 ```
