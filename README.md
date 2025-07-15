@@ -10,7 +10,7 @@ Single file implementation of llama3 models with pre-training script
 - [x] tests
 - [x] auto-regressive dataset
 - [x] simple pretrain script
-- [ ] fix huge abnormal loss (~120) should expect around log(vocab_size=49k) = ~10.8
+- [x] fix huge abnormal loss (~120) should expect around log(vocab_size=49k) = ~10.8
 - [ ] add wandb
 - [ ] try multiple optimizers sgd vs adamw vs muon, mixed precision
 - [ ] batch scheduling, custom dataloader ? control amount of token per batch...
