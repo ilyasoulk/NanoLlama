@@ -1,8 +1,8 @@
 import math
-from typing import Tuple, Union
 import yaml
 import argparse
 from dataclasses import dataclass
+from typing import Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -239,6 +239,7 @@ class Llama(nn.Module):
         self.norm = RMSNorm(d_model=config.d_model, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.lm_head.weight = self.embed_tokens.weight
+        self.apply(self._init_weights)
 
     def forward(
         self, x: torch.Tensor, output_hidden_states: bool = False
@@ -312,6 +313,22 @@ class Llama(nn.Module):
         model.lm_head.weight.data = hf_model.lm_head.weight.data.clone()
 
         return model
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    # def _init_weights(self, module):
+    #     if isinstance(module, nn.Linear):
+    #         fan_in = module.weight.size(1)
+    #         std = 0.02 / math.sqrt(2 * self.num_layers)
+    #         torch.nn.init.trunc_normal_(module.weight, mean=0.0, std=std, a=-0.04, b=0.04)
+    #         if module.bias is not None:
+    #             torch.nn.init.zeros_(module.bias)
+    #     elif isinstance(module, nn.Embedding):
+    #         torch.nn.init.trunc_normal_(module.weight, mean=0.0, std=0.02)
 
 
 if __name__ == "__main__":
