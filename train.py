@@ -2,6 +2,7 @@ import os
 import time
 import random
 import argparse
+from tqdm import tqdm
 from typing import Tuple
 
 
@@ -152,13 +153,12 @@ if __name__ == "__main__":
 
     model = torch.compile(model)
 
-    num_tokens = 0
-    for epoch in range(epochs):
+    total_num_tokens = 0
+    for epoch in range(1, epochs):
         train_loss = 0.0
         start = time.time()
-        for i, (x, y) in enumerate(train_loader):
-            if i > 10:  # temp, for testing
-                break
+        epoch_num_tokens = 0
+        for i, (x, y) in tqdm(enumerate(train_loader), desc="Training..."):
             x, y = x.to(device), y.to(device)
             logits = model(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
@@ -167,13 +167,38 @@ if __name__ == "__main__":
             optimizer.step()
 
             train_loss += loss.item()
-            num_tokens += num_batches * tokens_per_batch
+            epoch_num_tokens += x.numel()
 
+        scheduler.step()
         end = time.time()
         duration = end - start
-        avg_train_loss = train_loss / num_batches
-        tokens_per_second = (tokens_per_batch * num_batches) / duration
+        avg_train_loss = train_loss / len(train_loader)
+        tokens_per_second = epoch_num_tokens / duration
+        total_num_tokens += epoch_num_tokens
         print(
             f"Epoch: {epoch}, train loss : {avg_train_loss}, tokens/s : {tokens_per_second}"
         )
-        wandb.log({"epoch": epoch, "train_loss": avg_train_loss, "tokens": num_tokens})
+        wandb.log({
+            "epoch": epoch,
+            "train_loss": avg_train_loss,
+            "tokens": total_num_tokens,
+        })
+
+        if epoch % config["test_freq"] == 0:
+            test_loss = 0.0
+            model.eval()  # type:ignore
+            for i, (x, y) in tqdm(enumerate(test_loader), desc="Testing..."):
+                x, y = x.to(device), y.to(device)
+                with torch.no_grad():
+                    logits = model(x)
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+
+                test_loss += loss.item()
+
+            avg_test_loss = test_loss / len(test_loader)
+            print(f"Epoch: {epoch}, test_loss: {avg_test_loss}")
+            wandb.log({
+                "epoch": epoch,
+                "test_loss": avg_test_loss,
+                "tokens": total_num_tokens,
+            })
