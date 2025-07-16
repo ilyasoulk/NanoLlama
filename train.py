@@ -3,18 +3,18 @@ import time
 import argparse
 from typing import Tuple
 
-from torch.utils.data.dataloader import DataLoader
-import torch.nn.functional as F
-
 
 from llama import Llama, LlamaConfig
 
 import yaml
 import torch
+import wandb
 import numpy as np
+import torch.nn.functional as F
 from datasets import load_dataset
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
+from torch.utils.data.dataloader import DataLoader
 
 
 class NextTokenDataset(Dataset):
@@ -117,14 +117,19 @@ if __name__ == "__main__":
     tokens_per_batch = config["optim"]["batch_size"] * config["data"]["seq_len"]
     num_batches = len(train_loader)
 
+    wandb.init(
+        project="Llama3",
+        config=config,
+    )
+
     model = torch.compile(model)
 
+    num_tokens = 0
     for epoch in range(epochs):
         train_loss = 0.0
         start = time.time()
         for i, (x, y) in enumerate(train_loader):
             if i > 10:  # temp, for testing
-                num_batches = i - 1
                 break
             x, y = x.to(device), y.to(device)
             logits = model(x)
@@ -134,6 +139,7 @@ if __name__ == "__main__":
             optimizer.step()
 
             train_loss += loss.item()
+            num_tokens += num_batches * tokens_per_batch
 
         end = time.time()
         duration = end - start
@@ -142,3 +148,4 @@ if __name__ == "__main__":
         print(
             f"Epoch: {epoch}, train loss : {avg_train_loss}, tokens/s : {tokens_per_second}"
         )
+        wandb.log({"epoch": epoch, "train_loss": avg_train_loss, "tokens": num_tokens})
