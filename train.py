@@ -1,5 +1,6 @@
 import os
 import time
+import random
 import argparse
 from typing import Tuple
 
@@ -32,6 +33,12 @@ class NextTokenDataset(Dataset):
         x = torch.from_numpy(row[:-1])
         y = torch.from_numpy(row[1:])
         return x, y
+
+
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 def create_bin(
@@ -82,6 +89,14 @@ if __name__ == "__main__":
     with open(args.config_file, "r") as f:
         config = yaml.safe_load(f)
 
+    seed = config["seed"]
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if config["device"] == "cuda":
+        torch.cuda.manual_seed(seed)
+
     if not os.path.exists(config["data"]["data_path"]):
         create_bin(
             config["data"]["hf_data_path"],
@@ -90,16 +105,29 @@ if __name__ == "__main__":
             save_path=config["data"]["data_path"],
         )
 
+    g = torch.Generator()
+    g.manual_seed(seed)
+
     train_dataset = NextTokenDataset(
         data_path=config["data"]["train_data_path"], seq_len=config["data"]["seq_len"]
     )
     test_dataset = NextTokenDataset(
         data_path=config["data"]["test_data_path"], seq_len=config["data"]["seq_len"]
     )
+    # https://docs.pytorch.org/docs/stable/notes/randomness.html
     train_loader = DataLoader(
-        train_dataset, batch_size=config["optim"]["batch_size"], shuffle=True
+        train_dataset,
+        batch_size=config["optim"]["batch_size"],
+        shuffle=True,
+        worker_init_fn=seed_worker,
+        generator=g,
     )
-    test_loader = DataLoader(test_dataset, batch_size=config["optim"]["batch_size"])
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config["optim"]["batch_size"],
+        worker_init_fn=seed_worker,
+        generator=g,
+    )
 
     device = torch.device(config["device"])
     llama_config = LlamaConfig(**config["llama_config"])
