@@ -1,11 +1,11 @@
-d_model : 576
-intermediate_size : 1536
-vocab_size : 49152
-d_head : 64
-q_heads : 9
-num_layers : 30
-kv_heads : 3
-rms_norm_eps : 0.00001
-rope_theta : 100000 
-causal: True
-batch_size: 1
+D_MODEL : 576
+INTERMEDIATE_SIZE : 1536
+VOCAB_SIZE : 49152
+D_HEAD : 64
+Q_HEADS : 9
+NUM_LAYERS : 30
+KV_HEADS : 3
+RMS_NORM_EPS : 0.00001
+ROPE_THETA : 100000 
+CAUSAL: TRUE
+BATCH_SIZE: 1
