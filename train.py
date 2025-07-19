@@ -2,6 +2,7 @@ import os
 import time
 import random
 import argparse
+from itertools import cycle
 from tqdm import tqdm
 from typing import Tuple
 
@@ -16,6 +17,7 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
+from torch.nn.utils import clip_grad_norm_
 from torch.utils.data.dataloader import DataLoader
 
 
@@ -24,6 +26,7 @@ class NextTokenDataset(Dataset):
         super().__init__()
         self.seq_len = seq_len
         self.data = np.memmap(data_path, dtype=np.uint16, mode="r").reshape(-1, seq_len)
+        print(f"Number of tokens : {(self.data.size / 1e9):.4f}M")
 
     def __len__(self) -> int:
         return self.data.shape[0]
@@ -46,36 +49,37 @@ def create_bin(
     data_path: str,
     tokenizer_id: str,
     seq_len: int,
-    num_samples: int = 10_000,
+    num_samples: int | None = 10_000,
     save_path: str = "./data",
-    split: float = 0.8,
 ) -> None:
-    dataset = load_dataset(data_path, split="train", streaming=True)
-    data = list(dataset.take(num_samples))  # type: ignore
+    train_dataset = load_dataset(data_path, split="train", streaming=True)
+    test_dataset = load_dataset(data_path, split="validation", streaming=True)
+
+    if num_samples is not None:
+        train_dataset = list(train_dataset.take(num_samples))  # type: ignore
+        test_dataset = list(test_dataset)
+    else:
+        train_dataset = list(train_dataset)
+        test_dataset = list(test_dataset)
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
 
     if tokenizer.bos_token is None:
         tokenizer.add_special_tokens({"bos_token": "<bos>"})
-
     if tokenizer.eos_token is None:
         tokenizer.add_special_tokens({"eos_token": "<eos>"})
 
-    bos = tokenizer.bos_token
-    eos = tokenizer.eos_token
+    bos, eos = tokenizer.bos_token, tokenizer.eos_token
 
-    corpus = "".join([f"{bos} {d['text']} {eos}" for d in data])
+    def tokenize(dataset):
+        corpus = "".join([f"{bos} {d['text']} {eos}" for d in dataset])
+        tokens = tokenizer(corpus)["input_ids"]
+        num_tokens = len(tokens)
+        num_seq, r = divmod(num_tokens, seq_len)
+        return np.array(tokens[:-r], dtype=np.uint16).reshape(num_seq, seq_len)
 
-    outputs = tokenizer(corpus)
-    token_ids = outputs["input_ids"]
-
-    num_tokens = len(token_ids)
-    num_seq, r = divmod(num_tokens, seq_len)
-
-    np_token_ids = np.array(token_ids[:-r], dtype=np.uint16).reshape(num_seq, seq_len)
-    split_idx = int(split * num_seq)
-    train_data = np_token_ids[:split_idx]
-    test_data = np_token_ids[split_idx:]
+    train_data = tokenize(train_dataset)
+    test_data = tokenize(test_dataset)
 
     os.makedirs(save_path, exist_ok=True)
     train_data.tofile(os.path.join(save_path, "train.bin"))
@@ -98,12 +102,15 @@ if __name__ == "__main__":
     if config["device"] == "cuda":
         torch.cuda.manual_seed(seed)
 
+    seq_len = config["data"]["seq_len"]
+
     if not os.path.exists(config["data"]["data_path"]):
         create_bin(
             config["data"]["hf_data_path"],
             config["data"]["tokenizer_id"],
-            config["data"]["seq_len"],
+            seq_len,
             save_path=config["data"]["data_path"],
+            num_samples=None,
         )
 
     g = torch.Generator()
@@ -115,17 +122,19 @@ if __name__ == "__main__":
     test_dataset = NextTokenDataset(
         data_path=config["data"]["test_data_path"], seq_len=config["data"]["seq_len"]
     )
+    batch_size = config["optim"]["batch_size"]
+    grad_accum_steps = config["optim"]["grad_accum_steps"]
     # https://docs.pytorch.org/docs/stable/notes/randomness.html
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config["optim"]["batch_size"],
+        batch_size=batch_size,
         shuffle=True,
         worker_init_fn=seed_worker,
         generator=g,
     )
     test_loader = DataLoader(
         test_dataset,
-        batch_size=config["optim"]["batch_size"],
+        batch_size=batch_size,
         worker_init_fn=seed_worker,
         generator=g,
     )
@@ -134,57 +143,80 @@ if __name__ == "__main__":
     llama_config = LlamaConfig(**config["llama_config"])
     model = Llama(llama_config).to(device)
     num_params = sum([p.numel() for p in model.parameters()])
-    print(f"Number of parameters : {num_params}")
+    print(f"Number of parameters : {(num_params / 1e6):.2f}M")
 
-    optimizer = torch.optim.SGD(model.parameters(), config["optim"]["lr"])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, config["optim"]["t_max"]
-    )
+    lr = float(config["optim"]["lr"])
+    if "adamw" in config["optim"]:
+        beta1, beta2 = (
+            config["optim"]["adamw"]["beta1"],
+            config["optim"]["adamw"]["beta2"],
+        )
+        eps = float(config["optim"]["adamw"]["eps"])
+        weight_decay = config["optim"]["adamw"]["weight_decay"]
+        optimizer = torch.optim.AdamW(
+            params=model.parameters(),
+            lr=lr,
+            betas=(beta1, beta2),
+            eps=eps,
+            weight_decay=weight_decay,
+        )
+    else:
+        optimizer = torch.optim.SGD(model.parameters(), lr)
 
-    epochs = config["optim"]["epochs"]
+    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    #     optimizer, config["optim"]["t_max"]
+    # )
 
-    tokens_per_batch = config["optim"]["batch_size"] * config["data"]["seq_len"]
-    num_batches = len(train_loader)
+    max_norm = config["optim"]["max_norm"]
 
     wandb.init(
         project="Llama3",
         config=config,
     )
 
+    torch.set_float32_matmul_precision("high")
     model = torch.compile(model)
 
-    total_num_tokens = 0
-    for epoch in range(1, epochs):
-        train_loss = 0.0
+    num_tokens = 0
+    steps = config["optim"]["steps"]
+    train_iter = cycle(train_loader)
+    for step in range(0, steps):
+        acc_loss = 0.0
         start = time.time()
-        epoch_num_tokens = 0
-        for i, (x, y) in tqdm(enumerate(train_loader), desc="Training..."):
+        for i in range(grad_accum_steps):
+            x, y = next(train_iter)
             x, y = x.to(device), y.to(device)
+
             logits = model(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-            optimizer.zero_grad()
+            loss /= grad_accum_steps
+            acc_loss += loss.item()
             loss.backward()
-            optimizer.step()
 
-            train_loss += loss.item()
-            epoch_num_tokens += x.numel()
+            num_tokens += x.numel()
 
-        scheduler.step()
+        clip_grad_norm_(model.parameters(), max_norm=max_norm)
+        optimizer.step()
         end = time.time()
+        optimizer.zero_grad()
+        # scheduler.step()
+
         duration = end - start
-        avg_train_loss = train_loss / len(train_loader)
-        tokens_per_second = epoch_num_tokens / duration
-        total_num_tokens += epoch_num_tokens
+        tokens_per_second = (batch_size * grad_accum_steps * seq_len) / duration
+
         print(
-            f"Epoch: {epoch}, train loss : {avg_train_loss}, tokens/s : {tokens_per_second}"
+            f"Steps: {step} | train loss : {acc_loss:.4f} | tokens/s : {tokens_per_second:.2f}"
         )
         wandb.log({
-            "epoch": epoch,
-            "train_loss": avg_train_loss,
-            "tokens": total_num_tokens,
+            "steps": step,
+            "train_loss": acc_loss,
+            "tokens": num_tokens,
         })
 
-        if epoch % config["test_freq"] == 0:
+        acc_loss = 0.0
+        start = time.time()
+
+        if step % config["test_freq"] == 0:
             test_loss = 0.0
             model.eval()  # type:ignore
             for i, (x, y) in tqdm(enumerate(test_loader), desc="Testing..."):
@@ -196,9 +228,9 @@ if __name__ == "__main__":
                 test_loss += loss.item()
 
             avg_test_loss = test_loss / len(test_loader)
-            print(f"Epoch: {epoch}, test_loss: {avg_test_loss}")
+            print(f"Step: {step} | test_loss: {avg_test_loss}")
             wandb.log({
-                "epoch": epoch,
+                "step": step,
                 "test_loss": avg_test_loss,
-                "tokens": total_num_tokens,
+                "tokens": num_tokens,
             })
